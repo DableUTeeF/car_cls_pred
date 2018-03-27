@@ -1,0 +1,36 @@
+{
+    "model": {
+        "architecture": "MobileNet",
+        "input_size": [224, 416],
+        "anchors": [5.7273, 6.77385, 6.0, 5.3, 4.33843, 5.47434, 4.88282, 4.52778, 7.17052, 7.76828],
+        "max_box_per_image": 1,
+        "labels": ["Roofed pickup","High-roof pickup", "Pickup", "Motorcycle", "Van", "2-seat car", "Truck", "Bus", "Sedan", "Van-Sedan/SUV"]
+    },
+
+    "train": {
+        "train_image_folder": "/opt/work/car/car_yolo/car-Phuket-regioncrop/",
+        "train_annot_folder": "/opt/work/car/car_yolo/xml/",
+
+        "train_times": 10,
+        "pretrained_weights": "weights/car-3-4.h5",
+        "batch_size": 32,
+        "learning_rate": 1e-5,
+        "nb_epoch": 50,
+        "warmup_epochs": 5,
+
+        "object_scale": 5.0,
+        "no_object_scale": 1.0,
+        "coord_scale": 1.0,
+        "class_scale": 1.0,
+
+        "saved_weights_name": "weights/car-3-4.h5",
+        "debug": false
+    },
+
+    "valid": {
+        "valid_image_folder": "",
+        "valid_annot_folder": "",
+
+        "valid_times": 1
+    }
+}

@@ -89,20 +89,31 @@ def interval_overlap(interval_a, interval_b):
             return min(x2, x4) - x3
 
 
-def draw_boxes(image, boxes, labels):
+def draw_boxes(image, boxes, labels, classes=None):
     for box in boxes:
-        xmin = int((box.x - box.w / 2) * image.shape[1])
-        xmax = int((box.x + box.w / 2) * image.shape[1])
-        ymin = int((box.y - box.h / 2) * image.shape[0])
-        ymax = int((box.y + box.h / 2) * image.shape[0])
+        xmin = max(int((box.x - box.w / 2) * image.shape[1]), 0)
+        xmax = max(int((box.x + box.w / 2) * image.shape[1]), 0)
+        ymin = max(int((box.y - box.h / 2) * image.shape[0]), 0)
+        ymax = max(int((box.y + box.h / 2) * image.shape[0]), 0)
 
-        cv2.rectangle(image, (xmin, ymin), (xmax, ymax), (0, 255, 0), 3)
-        cv2.putText(image,
-                    labels[box.get_label()] + ' ' + str(box.get_score()),
-                    (xmin + 100, ymin + 100),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1e-3 * image.shape[0],
-                    (0, 255, 255), 2)
+        cv2.rectangle(image, (xmin, ymin), (xmax, ymax), (0, 255, 0), 1)
+        if classes is None:
+            cv2.putText(image,
+                        labels[box.get_label()] + ' ' + str(box.get_score()),
+                        (xmin + 100, ymin + 100),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1e-3 * image.shape[0],
+                        (0, 255, 255), 1)
+        else:
+            i = 1
+            for class_ in classes:
+                cv2.putText(image,
+                            labels[int(class_[0])]+': %3f' % class_[1],
+                            (xmin + 10, ymin + 30*i),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1e-3 * image.shape[0],
+                            (0, 255, 255), 1)
+                i += 1
 
     return image
 

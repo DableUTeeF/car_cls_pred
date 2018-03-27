@@ -9,8 +9,7 @@ import tensorflow as tf
 import numpy as np
 import os
 import cv2
-# from keras.applications.mobilenet import MobileNet
-from keras.optimizers import SGD, Adam, RMSprop
+from keras.optimizers import SGD, Adam
 from preprocessing import BatchGenerator
 from keras.callbacks import EarlyStopping, ModelCheckpoint, TensorBoard, ReduceLROnPlateau
 from utils import BoundBox
@@ -41,12 +40,12 @@ class YOLO(object):
         ##########################
 
         # make the feature extractor layers
-        input_image = Input(shape=(self.input_size[0], self.input_size[1], 3))
+        input_image = Input(shape=(self.input_size[1], self.input_size[0], 3))
         self.true_boxes = Input(shape=(1, 1, 1, self.max_box_per_image, 4))
 
         # self.feature_extractor = MobileNetFeature(self.input_size)
         if architecture == 'MobileNet':
-            self.feature_extractor = MobileNet(input_shape=(self.input_size[0], self.input_size[1], 3),
+            self.feature_extractor = MobileNet(input_shape=(self.input_size[1], self.input_size[0], 3),
                                                include_top=False,
                                                input_tensor=input_image,
                                                weights=None,
@@ -58,35 +57,29 @@ class YOLO(object):
             last_layer = 'leaky_1'
         elif architecture == 'InceptionResNet':
             self.feature_extractor = InceptionResNetV2(include_top=False,
-                                                       input_shape=(self.input_size[0], self.input_size[1], 3),
+                                                       input_shape=(self.input_size[1], self.input_size[0], 3),
                                                        input_tensor=input_image,
                                                        weights=None,
                                                        trainable=trainable)
             last_layer = 'conv_7b_ac'
         else:
             raise ValueError('Architecture must be either MobileNet or InceptionResNet')
-        # print(self.feature_extractor.summary())
-        # print(self.feature_extractor.get_output_shape())
-        # self.grid_h, self.grid_w = self.feature_extractor.get_output_shape()  # temporary
         if architecture == 'InceptionResNet':
             self.grid_h, self.grid_w = 11, 11
         else:
-            self.grid_h, self.grid_w = int(self.input_size[0] / 32), int(self.input_size[1] / 32)
+            self.grid_h, self.grid_w = int(self.input_size[1] / 32), int(self.input_size[0] / 32)
         features = self.feature_extractor.get_layer(last_layer).output
-        # features = self.feature_extractor.extract(input_image)
-        # self.model.summary()
         # make the object detection layer
         box_out = Conv2D(self.nb_box * (4 + 1 + self.nb_class),
                          (1, 1), strides=(1, 1),
                          padding='same',
-                         name='conv_23',
+                         name='conv_output',
                          kernel_initializer='lecun_normal')(features)
         box_out = Reshape((self.grid_h, self.grid_w, self.nb_box, 4 + 1 + self.nb_class))(box_out)
         box_out = Lambda(lambda args: args[0])([box_out, self.true_boxes])
         class_out = GlobalAveragePooling2D()(features)
         class_out = Dense(self.n_cls, activation='softmax')(class_out)
         self.model = Model([input_image, self.true_boxes], [box_out, class_out])
-        # self.model.load_weights(MOBILENET_FEATURE_PATH)
 
         # initialize the weights of the detection layer
         layer = self.model.layers[-4]
@@ -266,7 +259,7 @@ class YOLO(object):
     def load_weights(self, weight_path):
         self.model.load_weights(weight_path)
 
-    def predict(self, image, obj_threshold=0.3):
+    def predict(self, image, obj_threshold=0.3, k=1):
         image = cv2.resize(image, (self.input_size[0], self.input_size[1]))
         image = self.preprocess_input(image)
 
@@ -275,7 +268,7 @@ class YOLO(object):
         dummy_array = np.zeros((1, 1, 1, 1, self.max_box_per_image, 4))
 
         predict = self.model.predict([input_image, dummy_array])[0]
-        boxes = self.decode_netout(predict[0], obj_threshold=obj_threshold)
+        boxes = self.decode_netout(predict[0], obj_threshold=obj_threshold, k=k)
         cls = self.get_class(predict[1][0])
         return boxes, cls
 
@@ -283,3 +276,223 @@ class YOLO(object):
         srt = np.argsort(cls)
         prd = srt[-1*rank:]
         return prd
+
+    def decode_netout(self, netout, obj_threshold=0.3, nms_threshold=0.3, k=1):
+        grid_h, grid_w, nb_box = netout.shape[:3]
+
+        boxes = []
+
+        # decode the output by the network
+        netout[..., 4] = self.sigmoid(netout[..., 4])
+        netout[..., 5:] = netout[..., 4][..., np.newaxis] * self.softmax(netout[..., 5:])
+        netout[..., 5:] *= netout[..., 5:] > obj_threshold
+        cls = []
+        for row in range(grid_h):
+            for col in range(grid_w):
+                for b in range(nb_box):
+                    # from 4th element onwards are confidence and class classes
+                    classes = netout[row, col, b, 5:]
+
+                    if np.sum(classes) > 0:
+                        # first 4 elements are x, y, w, and h
+                        x, y, w, h = netout[row, col, b, :4]
+
+                        x = (col + self.sigmoid(x)) / grid_w  # center position, unit: image width
+                        y = (row + self.sigmoid(y)) / grid_h  # center position, unit: image height
+                        w = self.anchors[2 * b + 0] * np.exp(w) / grid_w  # unit: image width
+                        h = self.anchors[2 * b + 1] * np.exp(h) / grid_h  # unit: image height
+                        confidence = netout[row, col, b, 4]
+                        # print 'pso is:', x, y, w, h
+                        box = BoundBox(x, y, w, h, confidence, classes)
+
+                        boxes.append(box)
+                    if k > 1:
+                        srt = np.argsort(classes)
+                        class_ = []
+                        for _ in range(k):
+                            class_.append([srt[-1*(_+1)], classes[srt[-1*(_+1)]]])
+                        cls.append(class_)
+
+        # suppress non-maximal boxes
+        for c in range(self.nb_class):
+            sorted_indices = list(reversed(np.argsort([box.classes[c] for box in boxes])))
+
+            for i in range(len(sorted_indices)):
+                index_i = sorted_indices[i]
+
+                if boxes[index_i].classes[c] == 0:
+                    continue
+                else:
+                    for j in range(i + 1, len(sorted_indices)):
+                        index_j = sorted_indices[j]
+
+                        if self.bbox_iou(boxes[index_i], boxes[index_j]) >= nms_threshold:
+                            boxes[index_j].classes[c] = 0
+
+        # remove the boxes which are less likely than a obj_threshold
+        if obj_threshold > 0.:
+            boxes = [box for box in boxes if box.get_score() > obj_threshold]
+        else:
+            mx = 0
+            b = []
+            class_ = []
+            for i in range(len(boxes)):
+                box = boxes[i]
+                if box.get_score() > mx:
+                    mx = box.get_score()
+                    b = box
+                    class_ = cls[i]
+            boxes = [b]
+            cls = class_
+        if k == 1:
+            return boxes
+        else:
+            return boxes, cls
+
+    def bbox_iou(self, box1, box2):
+        x1_min = box1.x - box1.w / 2
+        x1_max = box1.x + box1.w / 2
+        y1_min = box1.y - box1.h / 2
+        y1_max = box1.y + box1.h / 2
+
+        x2_min = box2.x - box2.w / 2
+        x2_max = box2.x + box2.w / 2
+        y2_min = box2.y - box2.h / 2
+        y2_max = box2.y + box2.h / 2
+
+        intersect_w = self.interval_overlap([x1_min, x1_max], [x2_min, x2_max])
+        intersect_h = self.interval_overlap([y1_min, y1_max], [y2_min, y2_max])
+
+        intersect = intersect_w * intersect_h
+
+        union = box1.w * box1.h + box2.w * box2.h - intersect
+
+        return float(intersect) / union
+
+    def interval_overlap(self, interval_a, interval_b):
+        x1, x2 = interval_a
+        x3, x4 = interval_b
+
+        if x3 < x1:
+            if x4 < x1:
+                return 0
+            else:
+                return min(x2, x4) - x1
+        else:
+            if x2 < x3:
+                return 0
+            else:
+                return min(x2, x4) - x3
+
+    def sigmoid(self, x):
+        return 1. / (1. + np.exp(-x))
+
+    def softmax(self, x, axis=-1, t=-100.):
+        x = x - np.max(x)
+
+        if np.min(x) < t:
+            x = x / np.min(x) * t
+
+        e_x = np.exp(x)
+
+        return e_x / e_x.sum(axis, keepdims=True)
+    def train(self, train_imgs,  # the list of images to train the model
+              valid_imgs,  # the list of images used to validate the model
+              train_times,  # the number of time to repeat the training set, often used for small datasets
+              valid_times,  # the number of times to repeat the validation set, often used for small datasets
+              nb_epoch,  # number of epoches
+              learning_rate,  # the learning rate
+              batch_size,  # the size of the batch
+              warmup_epochs,  # number of initial batches to let the model familiarize with the new dataset
+              object_scale,
+              no_object_scale,
+              coord_scale,
+              class_scale,
+              saved_weights_name='best_weights.h5',
+              debug=False):
+
+        self.batch_size = batch_size
+        self.warmup_bs = warmup_epochs * (
+            train_times * (len(train_imgs) / batch_size + 1) + valid_times * (len(valid_imgs) / batch_size + 1))
+
+        self.object_scale = object_scale
+        self.no_object_scale = no_object_scale
+        self.coord_scale = coord_scale
+        self.class_scale = class_scale
+
+        self.debug = debug
+
+        if warmup_epochs > 0: nb_epoch = warmup_epochs  # if it's warmup stage, don't train more than warmup_epochs
+
+        ############################################
+        # Compile the model
+        ############################################
+        if warmup_epochs > 0:
+            optimizer = Adam(lr=learning_rate, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+        else:
+            optimizer = SGD(lr=learning_rate, momentum=0.9, decay=0.0005)
+        self.model.compile(loss=self.custom_loss, optimizer=optimizer)
+
+        ############################################
+        # Make train and validation generators
+        ############################################
+
+        generator_config = {
+            'IMAGE_H': self.input_size[1],
+            'IMAGE_W': self.input_size[0],
+            'GRID_H': self.grid_h,
+            'GRID_W': self.grid_w,
+            'BOX': self.nb_box,
+            'LABELS': self.labels,
+            'CLASS': len(self.labels),
+            'ANCHORS': self.anchors,
+            'BATCH_SIZE': self.batch_size,
+            'TRUE_BOX_BUFFER': self.max_box_per_image,
+        }
+
+        train_batch = BatchGenerator(train_imgs,
+                                     generator_config,
+                                     norm=preprocess_input)
+        valid_batch = BatchGenerator(valid_imgs,
+                                     generator_config,
+                                     norm=preprocess_input,
+                                     jitter=False)
+
+        ############################################
+        # Make a few callbacks
+        ############################################
+
+        early_stop = EarlyStopping(monitor='val_loss',
+                                   min_delta=0.001,
+                                   patience=3,
+                                   mode='min',
+                                   verbose=1)
+        checkpoint = ModelCheckpoint(saved_weights_name,
+                                     monitor='val_loss',
+                                     verbose=1,
+                                     save_best_only=True,
+                                     mode='min',
+                                     period=1)
+        tb_counter = len([log for log in os.listdir(os.path.expanduser('~/logs/')) if 'yolo' in log]) + 1
+        tensorboard = TensorBoard(log_dir=os.path.expanduser('~/logs/') + 'yolo' + '_' + str(tb_counter),
+                                  histogram_freq=0,
+                                  # write_batch_performance=True,
+                                  write_graph=True,
+                                  write_images=False)
+        lr_reduce = ReduceLROnPlateau(monitor='loss', factor=0.2,
+                                      patience=5, min_lr=0)
+
+        ############################################
+        # Start the training process
+        ############################################
+
+        self.model.fit_generator(generator=train_batch,
+                                 steps_per_epoch=len(train_batch) * train_times,
+                                 epochs=nb_epoch,
+                                 verbose=1,
+                                 validation_data=valid_batch,
+                                 validation_steps=len(valid_batch) * valid_times,
+                                 # callbacks=[early_stop, checkpoint, tensorboard],
+                                 callbacks=[checkpoint, tensorboard, lr_reduce],
+                                 workers=3,
+                                 max_queue_size=8)
