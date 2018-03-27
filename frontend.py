@@ -4,7 +4,7 @@ Slightly implemented from https://github.com/experiencor/basic-yolo-keras
 """
 from __future__ import print_function
 from keras.models import Model
-from keras.layers import Reshape, Dense, Conv2D, Input, GlobalAveragePooling2D, Lambda
+from keras.layers import Reshape, Conv2D, Input, GlobalAveragePooling2D, Lambda, Activation
 import tensorflow as tf
 import numpy as np
 import os
@@ -14,12 +14,13 @@ from preprocessing import BatchGenerator
 from keras.callbacks import EarlyStopping, ModelCheckpoint, TensorBoard, ReduceLROnPlateau
 from utils import BoundBox
 from models import MobileNet, DarkNet, InceptionResNetV2, preprocess_input
-
+from keras import metrics
 
 class YOLO(object):
     def __init__(self, architecture,  # Only MobileNet for now
                  input_size,  # a tuple (height, width)
                  labels,  # class for classification
+                 max_box_per_image,
                  anchors,
                  debug,
                  trainable=True):
@@ -27,12 +28,12 @@ class YOLO(object):
         self.input_size = input_size
         self.debug = debug
         self.labels = list(labels)
-        self.nb_class = 1
+        self.nb_class = len(self.labels)
         self.nb_box = 5
         self.class_wt = np.ones(self.nb_class, dtype='float32')
         self.anchors = anchors
         self.n_cls = len(self.labels)
-        self.max_box_per_image = 1
+        self.max_box_per_image = max_box_per_image
         self.preprocess_input = preprocess_input
 
         ##########################
@@ -78,11 +79,13 @@ class YOLO(object):
         box_out = Reshape((self.grid_h, self.grid_w, self.nb_box, 4 + 1 + self.nb_class))(box_out)
         box_out = Lambda(lambda args: args[0])([box_out, self.true_boxes])
         class_out = GlobalAveragePooling2D()(features)
-        class_out = Dense(self.n_cls, activation='softmax')(class_out)
+        class_out = Reshape((1, 1, 1024))(class_out)
+        class_out = Conv2D(10, (1, 1), padding='same', name='conv_preds')(class_out)
+        class_out = Activation('softmax')(class_out)
+        class_out = Reshape((10,), name='classifier')(class_out)
         self.model = Model([input_image, self.true_boxes], [box_out, class_out])
-
         # initialize the weights of the detection layer
-        layer = self.model.layers[-4]
+        layer = self.model.layers[-6]
         weights = layer.get_weights()
 
         new_kernel = np.random.normal(size=weights[0].shape) / (self.grid_h * self.grid_w)
@@ -96,9 +99,8 @@ class YOLO(object):
     def custom_loss(self, y_true, y_pred):
         cls_true = y_true[1]
         cls_pred = y_pred[1]
-        nb_class = y_true.shape[1]
-        y_true = y_true[0]
-        y_pred = y_pred[0]
+        # y_true = y_true[0]
+        # y_pred = y_pred[0]
         mask_shape = tf.shape(y_true)[:4]
 
         cell_x = tf.to_float(
@@ -109,7 +111,6 @@ class YOLO(object):
 
         coord_mask = tf.zeros(mask_shape)
         conf_mask = tf.zeros(mask_shape)
-        class_mask = tf.zeros(mask_shape)
 
         seen = tf.Variable(0.)
         total_recall = tf.Variable(0.)
@@ -117,28 +118,28 @@ class YOLO(object):
         """
         Adjust prediction
         """
-        ### adjust x and y
+        # adjust x and y
         pred_box_xy = tf.sigmoid(y_pred[..., :2]) + cell_grid
 
-        ### adjust w and h
+        # adjust w and h
         pred_box_wh = tf.exp(y_pred[..., 2:4]) * np.reshape(self.anchors, [1, 1, 1, self.nb_box, 2])
 
-        ### adjust confidence
+        # adjust confidence
         pred_box_conf = tf.sigmoid(y_pred[..., 4])
 
-        ### adjust class probabilities
+        # adjust class probabilities
         pred_box_class = y_pred[..., 5:]
 
         """
         Adjust ground truth
         """
-        ### adjust x and y
+        # adjust x and y
         true_box_xy = y_true[..., 0:2]  # relative position to the containing cell
 
-        ### adjust w and h
+        # adjust w and h
         true_box_wh = y_true[..., 2:4]  # number of cells accross, horizontally and vertically
 
-        ### adjust confidence
+        # adjust confidence
         true_wh_half = true_box_wh / 2.
         true_mins = true_box_xy - true_wh_half
         true_maxes = true_box_xy + true_wh_half
@@ -160,16 +161,16 @@ class YOLO(object):
 
         true_box_conf = iou_scores * y_true[..., 4]
 
-        ### adjust class probabilities
+        # adjust class probabilities
         true_box_class = tf.argmax(y_true[..., 5:], -1)
 
         """
         Determine the masks
         """
-        ### coordinate mask: simply the position of the ground truth boxes (the predictors)
+        # coordinate mask: simply the position of the ground truth boxes (the predictors)
         coord_mask = tf.expand_dims(y_true[..., 4], axis=-1) * self.coord_scale
 
-        ### confidence mask: penelize predictors + penalize boxes with low IOU
+        # confidence mask: penelize predictors + penalize boxes with low IOU
         # penalize the confidence of the boxes, which have IOU with some ground truth box < 0.6
         true_xy = self.true_boxes[..., 0:2]
         true_wh = self.true_boxes[..., 2:4]
@@ -202,7 +203,7 @@ class YOLO(object):
         # penalize the confidence of the boxes, which are reponsible for corresponding ground truth box
         conf_mask = conf_mask + y_true[..., 4] * self.object_scale
 
-        ### class mask: simply the position of the ground truth boxes (the predictors)
+        # class mask: simply the position of the ground truth boxes (the predictors)
         class_mask = y_true[..., 4] * tf.gather(self.class_wt, true_box_class) * self.class_scale
 
         """
@@ -236,8 +237,8 @@ class YOLO(object):
 
         loss_classifier = tf.nn.softmax_cross_entropy_with_logits(labels=cls_true, logits=cls_pred)
 
-        loss = loss_xy + loss_wh + loss_conf + loss_class + loss_classifier
-
+        loss = loss_xy + loss_wh + loss_conf + loss_class# + loss_classifier
+        # loss = sum(loss_xy, loss_wh, loss_conf)
         if self.debug:
             nb_true_box = tf.reduce_sum(y_true[..., 4])
             nb_pred_box = tf.reduce_sum(tf.to_float(true_box_conf > 0.5) * tf.to_float(pred_box_conf > 0.3))
@@ -245,7 +246,7 @@ class YOLO(object):
             current_recall = nb_pred_box / (nb_true_box + 1e-6)
             total_recall = tf.assign_add(total_recall, current_recall)
 
-            loss = tf.Print(loss, [tf.zeros((1))], message='Dummy Line \t', summarize=1000)
+            loss = tf.Print(loss, [tf.zeros(1)], message='Dummy Line \t', summarize=1000)
             loss = tf.Print(loss, [loss_xy], message='Loss XY \t', summarize=1000)
             loss = tf.Print(loss, [loss_wh], message='Loss WH \t', summarize=1000)
             loss = tf.Print(loss, [loss_conf], message='Loss Conf \t', summarize=1000)
@@ -272,7 +273,8 @@ class YOLO(object):
         cls = self.get_class(predict[1][0])
         return boxes, cls
 
-    def get_class(self, cls, rank=3):
+    @staticmethod
+    def get_class(cls, rank=3):
         srt = np.argsort(cls)
         prd = srt[-1*rank:]
         return prd
@@ -369,7 +371,8 @@ class YOLO(object):
 
         return float(intersect) / union
 
-    def interval_overlap(self, interval_a, interval_b):
+    @staticmethod
+    def interval_overlap(interval_a, interval_b):
         x1, x2 = interval_a
         x3, x4 = interval_b
 
@@ -384,10 +387,12 @@ class YOLO(object):
             else:
                 return min(x2, x4) - x3
 
-    def sigmoid(self, x):
+    @staticmethod
+    def sigmoid(x):
         return 1. / (1. + np.exp(-x))
 
-    def softmax(self, x, axis=-1, t=-100.):
+    @staticmethod
+    def softmax(x, axis=-1, t=-100.):
         x = x - np.max(x)
 
         if np.min(x) < t:
@@ -396,6 +401,7 @@ class YOLO(object):
         e_x = np.exp(x)
 
         return e_x / e_x.sum(axis, keepdims=True)
+
     def train(self, train_imgs,  # the list of images to train the model
               valid_imgs,  # the list of images used to validate the model
               train_times,  # the number of time to repeat the training set, often used for small datasets
@@ -431,7 +437,10 @@ class YOLO(object):
             optimizer = Adam(lr=learning_rate, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
         else:
             optimizer = SGD(lr=learning_rate, momentum=0.9, decay=0.0005)
-        self.model.compile(loss=self.custom_loss, optimizer=optimizer)
+        self.model.compile(loss=[self.custom_loss, 'categorical_crossentropy'],
+                           optimizer=optimizer,
+                           metrics=['acc'])
+        # self.model.compile(loss='mse', optimizer=optimizer)
 
         ############################################
         # Make train and validation generators
@@ -452,10 +461,10 @@ class YOLO(object):
 
         train_batch = BatchGenerator(train_imgs,
                                      generator_config,
-                                     norm=preprocess_input)
+                                     norm=normalize, jitter=False)
         valid_batch = BatchGenerator(valid_imgs,
                                      generator_config,
-                                     norm=preprocess_input,
+                                     norm=normalize,
                                      jitter=False)
 
         ############################################
@@ -496,3 +505,11 @@ class YOLO(object):
                                  callbacks=[checkpoint, tensorboard, lr_reduce],
                                  workers=3,
                                  max_queue_size=8)
+
+
+def normalize(image):
+    image = image / 255.
+    image = image - 0.5
+    image = image * 2.
+
+    return image

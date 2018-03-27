@@ -51,7 +51,8 @@ if __name__ == '__main__':
                     input_size=config['model']['input_size'],
                     labels=config['model']['labels'],
                     max_box_per_image=config['model']['max_box_per_image'],
-                    anchors=config['model']['anchors'], trainable=True)
+                    anchors=config['model']['anchors'], trainable=True,
+                    debug=config['train']['debug'])
 
         ###############################
         #   Load the pretrained weights (if any)
